@@ -1,0 +1,17 @@
+# oauth credentials - never commit these
+credentials.json
+token.pickle
+
+# leftover manual credential notes, if these exist on disk
+api-key_youtube_api.txt
+oauth_client_id.txt
+
+# downloaded video/thumbnail files (deleted after each upload, but
+# ignore the folder in case a crashed job leaves something behind)
+/downloads/
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
