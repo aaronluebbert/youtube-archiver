@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 youtube archive tool - gui with queue, cancel, robust url parsing,
-fast metadata via the youtube data api, edge-case handling, and a
-source-video link prepended to the uploaded description
+fast metadata via the youtube data api, edge-case handling, a
+source-video link prepended to the description, and clean numeric
+progress reporting for both download and upload
 """
 
 import os
@@ -35,6 +36,7 @@ TOKEN_FILE = "token.pickle"
 DOWNLOAD_DIR = "downloads"
 MAX_UPLOAD_RETRIES = 5
 YOUTUBE_DESCRIPTION_LIMIT = 5000  # youtube's hard cap on description length
+UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024  # 10mb - a real chunk size is required for incremental progress at all
 
 
 class JobCancelled(Exception):
@@ -118,14 +120,26 @@ def extract_video_id(raw_url):
 # ---------- core pipeline ----------
 
 def fetch_metadata(youtube, video_id):
-    # single rest call against the real data api - fast and reliable,
-    # unlike yt-dlp's extraction which has to negotiate with youtube's
-    # player/signature system just to read title/description/tags
-    resp = youtube.videos().list(part="snippet", id=video_id).execute()
+    # request contentDetails alongside snippet so the video's duration
+    # is available too, not just title/description/tags
+    resp = youtube.videos().list(part="snippet,contentDetails", id=video_id).execute()
     items = resp.get("items", [])
     if not items:
         raise ValueError("video not found, private, deleted, or not accessible with this account")
-    return items[0]["snippet"]
+    snippet = items[0]["snippet"]
+    snippet["duration_minutes"] = parse_duration_minutes(items[0]["contentDetails"]["duration"])
+    return snippet
+
+DURATION_PATTERN = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+def parse_duration_minutes(iso_duration):
+    # youtube returns duration in iso 8601 format like "PT1H2M10S" -
+    # this pulls out hours/minutes/seconds and returns the total in minutes
+    match = DURATION_PATTERN.fullmatch(iso_duration or "")
+    if not match:
+        return None
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return hours * 60 + minutes + seconds / 60
 
 
 def check_archivable(snippet):
@@ -140,9 +154,7 @@ def check_archivable(snippet):
 
 def build_description(video_id, original_description):
     # prepend the source link, then fit as much of the original
-    # description as still fits under youtube's 5000-char limit -
-    # protects against a rare edge case where a source video already
-    # has a near-max-length description
+    # description as still fits under youtube's 5000-char limit
     prefix = f"Original video: https://youtu.be/{video_id}\n\n"
     available = YOUTUBE_DESCRIPTION_LIMIT - len(prefix)
     if available <= 0:
@@ -193,7 +205,7 @@ def download_video(video_id, out_dir, progress_hook):
     return merged
 
 
-def upload_video(youtube, video_path, video_id, snippet, thumb_path, log, cancel_event):
+def upload_video(youtube, video_path, video_id, snippet, thumb_path, log, status, cancel_event):
     body_snippet = {
         "title": snippet.get("title", "Untitled"),
         "description": build_description(video_id, snippet.get("description", "") or ""),
@@ -213,18 +225,24 @@ def upload_video(youtube, video_path, video_id, snippet, thumb_path, log, cancel
         },
     }
 
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/x-matroska")
+    # a real chunk size (not -1) is required to get any incremental
+    # progress at all - chunksize=-1 sends the whole file in one
+    # request, so there was nothing to report until it was already done
+    media = MediaFileUpload(video_path, chunksize=UPLOAD_CHUNK_SIZE, resumable=True, mimetype="video/x-matroska")
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
     retry_count = 0
+    upload_start = time.time()
     while response is None:
         if cancel_event.is_set():
             raise JobCancelled("cancelled during upload")
         try:
-            status, response = request.next_chunk()
-            if status:
-                log(f"upload progress: {int(status.progress() * 100)}%")
+            chunk_status, response = request.next_chunk()
+            if chunk_status:
+                elapsed_min = (time.time() - upload_start) / 60
+                percent = chunk_status.progress() * 100
+                status(f"Uploading - {elapsed_min:.1f} min - {percent:.2f}%")
             retry_count = 0
         except HttpError as e:
             # 5xx errors are usually transient - a brief backoff and
@@ -275,6 +293,9 @@ def process_job(job_id, video_id, gui_queue, cancel_event):
         status("Fetching metadata")
         snippet = fetch_metadata(youtube, video_id)
         check_archivable(snippet)
+        duration = snippet.get("duration_minutes")
+        if duration is not None:
+            log(f"video length: {duration:.2f} min")
         check_cancel()
 
         status("Fetching thumbnail")
@@ -285,9 +306,17 @@ def process_job(job_id, video_id, gui_queue, cancel_event):
             if cancel_event.is_set():
                 raise JobCancelled("cancelled during download")
             if d["status"] == "downloading":
-                pct = d.get("_percent_str", "").strip()
-                if pct:
-                    status(f"Downloading {pct}")
+                # compute from raw numbers instead of yt-dlp's
+                # pre-formatted _percent_str, which can carry
+                # terminal-only control characters
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                elapsed_min = d.get("elapsed", 0) / 60
+                if total:
+                    percent = (downloaded / total) * 100
+                    status(f"Downloading - {elapsed_min:.1f} min - {percent:.2f}%")
+                else:
+                    status(f"Downloading - {elapsed_min:.1f} min")
             elif d["status"] == "finished":
                 status("Merging")
 
@@ -296,7 +325,75 @@ def process_job(job_id, video_id, gui_queue, cancel_event):
         check_cancel()
 
         status("Uploading")
-        upload_video(youtube, video_path, video_id, snippet, thumb_path, log, cancel_event)
+        upload_video(youtube, video_path, video_id, snippet, thumb_path, log, status, cancel_event)
+
+        status("Cleaning up")
+        for p in (video_path, thumb_path):
+            if p and os.path.exists(p):
+                os.remove(p)
+
+        status("Done")
+
+    except JobCancelled:
+        for p in (video_path, thumb_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        status("Cancelled")
+        log("job cancelled by user")
+
+    except HttpError as e:
+        for p in (video_path, thumb_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # surface quota exhaustion as its own distinct status rather
+        # than a generic error, since the fix is "wait," not "debug"
+        if e.resp.status == 403 and "quota" in str(e).lower():
+            status("Quota Exceeded")
+            log("daily youtube upload quota hit - resets at midnight pacific time")
+        else:
+            status("Error")
+            log(f"error: {e}")
+
+    except Exception as e:
+        for p in (video_path, thumb_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        status("Error")
+        log(f"error: {e}")
+
+        def hook(d):
+            if cancel_event.is_set():
+                raise JobCancelled("cancelled during download")
+            if d["status"] == "downloading":
+                # compute from raw numbers instead of yt-dlp's
+                # pre-formatted _percent_str, which can carry
+                # terminal-only control characters
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                elapsed_min = d.get("elapsed", 0) / 60
+                if total:
+                    percent = (downloaded / total) * 100
+                    status(f"Downloading - {elapsed_min:.1f} min - {percent:.2f}%")
+                else:
+                    status(f"Downloading - {elapsed_min:.1f} min")
+            elif d["status"] == "finished":
+                status("Merging")
+
+        status("Downloading")
+        video_path = download_video(video_id, DOWNLOAD_DIR, hook)
+        check_cancel()
+
+        status("Uploading")
+        upload_video(youtube, video_path, video_id, snippet, thumb_path, log, status, cancel_event)
 
         status("Cleaning up")
         for p in (video_path, thumb_path):
